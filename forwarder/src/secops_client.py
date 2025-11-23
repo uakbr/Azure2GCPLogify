@@ -7,12 +7,16 @@ from typing import List, Dict, Any
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from .metrics import (
+    SECOPS_BATCHES_SENT, SECOPS_BATCHES_FAILED, LOG_ENTRIES_PROCESSED, BATCH_SIZE_BYTES
+)
+
 class SecOpsClient:
-    def __init__(self, ingestion_endpoint: str, customer_id: str):
+    def __init__(self, ingestion_endpoint: str, customer_id: str, max_payload_size_bytes: int = 10 * 1024 * 1024):
         self.ingestion_endpoint = ingestion_endpoint
         self.customer_id = customer_id
         self.credentials, self.project = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-        self.max_payload_size_bytes = 10 * 1024 * 1024  # 10MB limit
+        self.max_payload_size_bytes = max_payload_size_bytes
         
         # Configure retry strategy
         retry_strategy = Retry(
@@ -84,12 +88,22 @@ class SecOpsClient:
         }
         
         try:
-            response = self.session.post(self.ingestion_endpoint, headers=headers, json=payload, timeout=30)
+            payload_json = json.dumps(payload)
+            payload_size = len(payload_json.encode('utf-8'))
+            
+            response = self.session.post(self.ingestion_endpoint, headers=headers, data=payload_json, timeout=30)
             response.raise_for_status()
+            
+            SECOPS_BATCHES_SENT.labels(log_type=log_type).inc()
+            LOG_ENTRIES_PROCESSED.labels(log_type=log_type).inc(len(entries))
+            BATCH_SIZE_BYTES.labels(log_type=log_type).observe(payload_size)
+            
         except requests.exceptions.RequestException as e:
             # The retry adapter handles retries for 5xx/429. 
             # If we are here, it's a permanent failure or retries exhausted.
             print(f"Error sending batch: {e}")
             if hasattr(e, 'response') and e.response is not None:
                 print(f"Response content: {e.response.text}")
+            
+            SECOPS_BATCHES_FAILED.labels(log_type=log_type).inc()
             raise

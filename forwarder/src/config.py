@@ -12,6 +12,7 @@ class ContainerConfig(BaseModel):
 class StorageAccountConfig(BaseModel):
     name: str
     account_url: str
+    connection_string_env_var: Optional[str] = None
     containers: List[ContainerConfig]
 
 class TenantConfig(BaseModel):

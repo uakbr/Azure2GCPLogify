@@ -19,6 +19,7 @@ This forwarder provides:
 - **Resilience**: At-least-once delivery guarantee with automatic retries and backoff.
 - **Efficiency**: Smart batching to respect SecOps API limits (10MB payloads).
 - **Concurrency**: Parallel processing of multiple containers.
+- **Observability**: Prometheus metrics endpoint for monitoring throughput and health.
 
 ---
 
@@ -27,27 +28,75 @@ This forwarder provides:
 The system follows a poll-process-push model, designed for horizontal scalability.
 
 ```mermaid
-graph LR
-    subgraph Azure Cloud
-        A[("Blob Storage\n(Logs)")]
-        B[("Table Storage\n(State)")]
+flowchart LR
+    %% Styling
+    classDef azure fill:#0072C6,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef google fill:#4285F4,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef app fill:#2d3436,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef monitor fill:#6c5ce7,stroke:#fff,stroke-width:2px,color:#fff;
+
+    subgraph Azure["Azure Cloud"]
+        Blob[("Blob Storage\n(Logs)")]:::azure
+        Table[("Table Storage\n(State)")]:::azure
     end
     
-    subgraph Forwarder Service
-        C[("Azure Client\n(Streaming)")]
-        D{("Logic Core")}
-        E[("SecOps Client\n(Batching)")]
+    subgraph App["Forwarder Service"]
+        direction TB
+        AC["Azure Client\n(Streaming)"]:::app
+        Logic{"Logic Core\n(Batching/Dedupe)"}:::app
+        SC["SecOps Client\n(Retries)"]:::app
+        Metrics["Prometheus\n(:8000)"]:::app
     end
     
-    subgraph Google Cloud
-        F[("SecOps Ingestion API")]
+    subgraph Google["Google Cloud"]
+        API["SecOps Ingestion API"]:::google
+    end
+    
+    subgraph Ops["Operations"]
+        Monitor["Monitoring System"]:::monitor
     end
 
-    A -->|Stream Chunks| C
-    C --> D
-    D -->|Check/Update| B
-    D --> E
-    E -->|HTTPS POST| F
+    Blob -->|Stream Chunks| AC
+    AC --> Logic
+    Logic -->|Check ETag/Size| Table
+    Logic -->|Update State| Table
+    Logic -->|Batched Logs| SC
+    SC -->|HTTPS POST| API
+    Metrics -.->|Scrape| Monitor
+```
+
+### 🔄 Ingestion Logic Flow
+
+```mermaid
+sequenceDiagram
+    participant Main
+    participant Azure as Azure Storage
+    participant State as Table Storage
+    participant SecOps as SecOps API
+
+    loop Every Poll Interval
+        Main->>Azure: List Blobs (Prefix)
+        Azure-->>Main: Blob Metadata
+        
+        loop For Each Blob
+            Main->>State: Check if Processed (ETag, Size)
+            alt Already Processed
+                Main->>Main: Skip
+            else New Blob
+                Main->>Azure: Stream Content
+                loop Chunk Processing
+                    Azure-->>Main: Data Chunk
+                    Main->>Main: Parse JSON & Accumulate
+                    opt Batch > Limit
+                        Main->>SecOps: POST Batch
+                    end
+                end
+                Main->>SecOps: POST Remaining
+                SecOps-->>Main: 200 OK
+                Main->>State: Mark Processed (ETag, Size)
+            end
+        end
+    end
 ```
 
 ---
@@ -89,6 +138,8 @@ azure:
       storage_accounts:
         - name: "stsecopslogs001"
           account_url: "https://stsecopslogs001.blob.core.windows.net"
+          # Optional: Env var name for this specific account's connection string
+          connection_string_env_var: "CONN_STR_STSECOPSLOGS001"
           containers:
             - name: "custom-logs"
               prefixes: ["firewall/", "waf/"]
@@ -100,6 +151,8 @@ forwarder:
   poll_interval_seconds: 60
   state_container: "forwarderstate" # Table Name
   max_parallel_containers: 4
+  batch_size: 500 # Max logs per batch (approx)
+  max_bytes_per_batch: 5000000 # 5MB limit (SecOps limit is 10MB)
 ```
 
 ### 3. Running the Forwarder
@@ -107,10 +160,11 @@ forwarder:
 The forwarder requires credentials for both Azure and Google Cloud.
 
 **Environment Variables:**
-- `AZURE_STORAGE_CONNECTION_STRING`: Connection string for the log storage account.
-- `AZURE_STATE_CONNECTION_STRING`: Connection string for the state storage account (can be the same as above).
+- `AZURE_STORAGE_CONNECTION_STRING`: Default connection string for log storage.
+- `AZURE_STATE_CONNECTION_STRING`: Connection string for state storage.
 - `GOOGLE_APPLICATION_CREDENTIALS`: Path to your GCP Service Account JSON key.
 - `FORWARDER_POLL_INTERVAL_SECONDS`: (Optional) Override poll interval.
+- `CONN_STR_STSECOPSLOGS001`: (Optional) Specific connection string if configured in `config.yaml`.
 
 **Docker Run:**
 
@@ -118,9 +172,10 @@ The forwarder requires credentials for both Azure and Google Cloud.
 # Build the image
 docker build -t secops-forwarder ./forwarder
 
-# Run the container
+# Run the container (exposing port 8000 for metrics)
 docker run -d \
   --name secops-forwarder \
+  -p 8000:8000 \
   -e AZURE_STORAGE_CONNECTION_STRING="..." \
   -e AZURE_STATE_CONNECTION_STRING="..." \
   -e GOOGLE_APPLICATION_CREDENTIALS="/app/key.json" \
@@ -128,6 +183,19 @@ docker run -d \
   -v $(pwd)/gcp-key.json:/app/key.json \
   secops-forwarder
 ```
+
+---
+
+## 📊 Observability
+
+The forwarder exposes Prometheus metrics on port **8000** at `/metrics`.
+
+**Key Metrics:**
+- `secops_forwarder_blobs_processed_total`: Blobs successfully ingested.
+- `secops_forwarder_blobs_failed_total`: Blobs that failed processing.
+- `secops_forwarder_log_entries_skipped_total`: Malformed JSON lines skipped.
+- `secops_forwarder_batches_sent_total`: Batches successfully sent to SecOps.
+- `secops_forwarder_processing_time_seconds`: Histogram of blob processing duration.
 
 ---
 

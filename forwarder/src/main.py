@@ -5,10 +5,15 @@ import os
 import signal
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from prometheus_client import start_http_server
 from .config import load_config
 from .azure_client import AzureClient
 from .secops_client import SecOpsClient
 from .state_manager import StateManager
+from .metrics import (
+    BLOBS_FOUND, BLOBS_PROCESSED, BLOBS_FAILED, LOG_ENTRIES_SKIPPED,
+    BLOB_SIZE_BYTES, PROCESSING_TIME_SECONDS, FORWARDER_UP
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -20,7 +25,7 @@ def signal_handler(signum, frame):
     logger.info("Shutdown signal received. Exiting...")
     shutdown_event.set()
 
-def process_container(container_config, sa_config, azure_client, state_manager, secops_client):
+def process_container(container_config, sa_config, azure_client, state_manager, secops_client, batch_size_limit):
     """
     Process a single container.
     """
@@ -37,6 +42,8 @@ def process_container(container_config, sa_config, azure_client, state_manager, 
             if shutdown_event.is_set():
                 break
 
+            BLOBS_FOUND.labels(container=container_config.name, storage_account=sa_config.name).inc()
+            
             last_modified = blob.last_modified.isoformat()
             etag = blob.etag
             size = blob.size
@@ -45,20 +52,17 @@ def process_container(container_config, sa_config, azure_client, state_manager, 
                 continue
             
             logger.info(f"Processing new blob: {blob.name} (Size: {size})")
+            start_time = time.time()
             
             try:
                 # Stream blob content and batch send immediately
-                # Do NOT accumulate all logs in memory
                 current_batch = []
-                # We reuse SecOpsClient's internal batching logic by calling send_logs with chunks
-                # But SecOpsClient.send_logs expects a list and handles batching. 
-                # To be memory efficient, we should accumulate a reasonable chunk here (e.g. 1000 lines or 5MB)
-                # and send it. 
                 
                 buffer = ""
                 batch_accumulator = []
                 batch_size_estimate = 0
-                MAX_BATCH_SIZE = 5 * 1024 * 1024 # 5MB intermediate buffer
+                # Use configured batch size limit (e.g. 5MB) for intermediate flushes
+                MAX_BATCH_SIZE = batch_size_limit 
                 
                 for chunk in azure_client.stream_blob(container_config.name, blob.name):
                     text_chunk = chunk.decode('utf-8', errors='ignore')
@@ -79,6 +83,7 @@ def process_container(container_config, sa_config, azure_client, state_manager, 
                                     
                             except json.JSONDecodeError:
                                 logger.warning(f"Skipping malformed JSON line in {blob.name}")
+                                LOG_ENTRIES_SKIPPED.labels(container=container_config.name).inc()
                 
                 # Process remaining buffer
                 if buffer.strip():
@@ -87,6 +92,7 @@ def process_container(container_config, sa_config, azure_client, state_manager, 
                         batch_accumulator.append(log_entry)
                     except json.JSONDecodeError:
                         logger.warning(f"Skipping malformed JSON in buffer for {blob.name}")
+                        LOG_ENTRIES_SKIPPED.labels(container=container_config.name).inc()
 
                 # Send remaining logs
                 if batch_accumulator:
@@ -95,8 +101,13 @@ def process_container(container_config, sa_config, azure_client, state_manager, 
                 # Mark processed ONLY after success
                 state_manager.mark_processed(container_config.name, blob.name, etag, size, last_modified)
                 
+                BLOBS_PROCESSED.labels(container=container_config.name, storage_account=sa_config.name).inc()
+                BLOB_SIZE_BYTES.labels(container=container_config.name).observe(size)
+                PROCESSING_TIME_SECONDS.labels(container=container_config.name).observe(time.time() - start_time)
+                
             except Exception as e:
                 logger.error(f"Failed to process blob {blob.name}: {e}")
+                BLOBS_FAILED.labels(container=container_config.name, storage_account=sa_config.name).inc()
                 # Do NOT mark as processed, so it retries
 
 def main():
@@ -104,6 +115,10 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     logger.info("Starting SecOps Forwarder...")
+    
+    # Start Prometheus Metrics Server
+    start_http_server(8000)
+    FORWARDER_UP.set(1)
     
     try:
         config = load_config()
@@ -113,7 +128,8 @@ def main():
 
     secops_client = SecOpsClient(
         ingestion_endpoint=config.gsecops.ingestion_endpoint,
-        customer_id=config.gsecops.customer_id
+        customer_id=config.gsecops.customer_id,
+        max_payload_size_bytes=config.forwarder.max_bytes_per_batch
     )
 
     # State Manager Init
@@ -152,11 +168,17 @@ def main():
             for sa_config in tenant.storage_accounts:
                 try:
                     # Determine credential/connection for this SA
-                    # In this simple config, we only have account_url. 
-                    # We assume DefaultAzureCredential works or AZURE_STORAGE_CONNECTION_STRING is set (but that's global).
-                    # If we want per-SA connection strings, we'd need them in config or env vars mapped by name.
-                    # For now, we assume DefaultAzureCredential or global env var.
-                    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+                    # Check for per-account connection string env var
+                    connection_string = None
+                    if sa_config.connection_string_env_var:
+                        connection_string = os.getenv(sa_config.connection_string_env_var)
+                        if not connection_string:
+                            logger.warning(f"Env var {sa_config.connection_string_env_var} not set for SA {sa_config.name}. Falling back to global/default.")
+                    
+                    # Fallback to global
+                    if not connection_string:
+                        connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+                        
                     azure_client = AzureClient(account_url=sa_config.account_url, connection_string=connection_string)
                     
                     for container_config in sa_config.containers:
@@ -166,8 +188,10 @@ def main():
 
         # Execute in parallel
         with ThreadPoolExecutor(max_workers=config.forwarder.max_parallel_containers or 4) as executor:
+            # We use half of the max payload size for intermediate flushing to be safe and allow SecOpsClient to batch efficiently
+            intermediate_batch_limit = int(config.forwarder.max_bytes_per_batch / 2)
             futures = [
-                executor.submit(process_container, cc, sac, ac, state_manager, secops_client) 
+                executor.submit(process_container, cc, sac, ac, state_manager, secops_client, intermediate_batch_limit) 
                 for cc, sac, ac in work_items
             ]
             
