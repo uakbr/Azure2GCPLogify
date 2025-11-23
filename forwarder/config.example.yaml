@@ -1,0 +1,21 @@
+env: "dev"
+azure:
+  tenants:
+    - name: "primary-tenant"
+      tenant_id: "00000000-0000-0000-0000-000000000000"
+      storage_accounts:
+        - name: "stdevsecopslogs001"
+          account_url: "https://stdevsecopslogs001.blob.core.windows.net"
+          containers:
+            - name: "custom-logs"
+              prefixes:
+                - "firewall/"
+              log_type: "AZURE_CUSTOM_FIREWALL"
+gsecops:
+  ingestion_endpoint: "https://malachiteingestion-pa.googleapis.com/v1/ingestion"
+  customer_id: "YOUR_CUSTOMER_ID"
+forwarder:
+  batch_size: 500
+  max_bytes_per_batch: 1000000
+  poll_interval_seconds: 60
+  state_container: "forwarder-state"
