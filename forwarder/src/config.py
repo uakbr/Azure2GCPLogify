@@ -31,7 +31,7 @@ class ForwarderConfig(BaseModel):
     batch_size: int = 500
     max_bytes_per_batch: int = 1_000_000
     poll_interval_seconds: int = 60
-    state_container: str = "forwarder-state"
+    state_container: str = "forwarderstate"
 
 class AppConfig(BaseModel):
     env: str
@@ -43,8 +43,17 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
     with open(config_path, "r") as f:
         raw_config = yaml.safe_load(f)
     
-    # Override with env vars if needed (simplified for now)
+    # Override with env vars
     if os.getenv("GSECOPS_CUSTOMER_ID"):
         raw_config["gsecops"]["customer_id"] = os.getenv("GSECOPS_CUSTOMER_ID")
+        
+    if os.getenv("FORWARDER_POLL_INTERVAL_SECONDS"):
+        try:
+            raw_config["forwarder"]["poll_interval_seconds"] = int(os.getenv("FORWARDER_POLL_INTERVAL_SECONDS"))
+        except ValueError:
+            pass
+
+    if os.getenv("FORWARDER_STATE_CONTAINER"):
+        raw_config["forwarder"]["state_container"] = os.getenv("FORWARDER_STATE_CONTAINER")
 
     return AppConfig(**raw_config)

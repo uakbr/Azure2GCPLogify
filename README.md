@@ -16,8 +16,9 @@ This solution bridges the gap between Azure's storage-centric logging and Google
 This forwarder provides:
 - **Stateless Design**: Uses Azure Table Storage for distributed state tracking.
 - **Memory Safety**: Streams large log files to prevent OOM errors.
-- **Resilience**: At-least-once delivery guarantee with automatic retries.
+- **Resilience**: At-least-once delivery guarantee with automatic retries and backoff.
 - **Efficiency**: Smart batching to respect SecOps API limits (10MB payloads).
+- **Concurrency**: Parallel processing of multiple containers.
 
 ---
 
@@ -62,7 +63,7 @@ graph LR
 
 ### 1. Infrastructure Deployment
 
-We use Terraform to provision the necessary Azure Storage resources.
+We use Terraform to provision the necessary Azure Storage resources, including the Table Storage for state.
 
 ```bash
 cd infra/terraform
@@ -73,7 +74,8 @@ terraform apply -var="storage_account_name=stsecopslogs001"
 This will create:
 - Storage Account for logs.
 - Blob Containers (`custom-logs`, `activity-logs`, etc.).
-- **Table Storage** for forwarder state tracking.
+- **Table Storage** (`forwarderstate`) for forwarder state tracking.
+- **Output**: The connection string for the storage account (sensitive).
 
 ### 2. Configuration
 
@@ -97,6 +99,7 @@ gsecops:
 forwarder:
   poll_interval_seconds: 60
   state_container: "forwarderstate" # Table Name
+  max_parallel_containers: 4
 ```
 
 ### 3. Running the Forwarder
@@ -107,6 +110,7 @@ The forwarder requires credentials for both Azure and Google Cloud.
 - `AZURE_STORAGE_CONNECTION_STRING`: Connection string for the log storage account.
 - `AZURE_STATE_CONNECTION_STRING`: Connection string for the state storage account (can be the same as above).
 - `GOOGLE_APPLICATION_CREDENTIALS`: Path to your GCP Service Account JSON key.
+- `FORWARDER_POLL_INTERVAL_SECONDS`: (Optional) Override poll interval.
 
 **Docker Run:**
 
@@ -130,9 +134,9 @@ docker run -d \
 ## 🛠 Development & Customization
 
 ### Adding New Log Sources
-1.  **Export**: Configure your Azure resource to export logs to a Blob Container.
+1.  **Export**: Configure your Azure resource to export logs to a Blob Container in the SecOps Storage Account.
 2.  **Config**: Add the container and prefix to `config.yaml`.
-3.  **Restart**: Restart the forwarder to pick up the new configuration.
+3.  **Restart**: Restart the forwarder to pick up the new configuration (or send SIGTERM to trigger graceful shutdown).
 
 ### Monitoring
 The forwarder outputs structured logs to `stdout`. Monitor these logs for:

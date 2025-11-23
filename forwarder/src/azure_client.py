@@ -1,18 +1,19 @@
-import os
-from typing import List, Generator, Any
+from typing import Generator, Any
 from azure.storage.blob import BlobServiceClient, BlobProperties
-from azure.core.exceptions import ResourceNotFoundError
 
 class AzureClient:
-    def __init__(self, account_url: str, credential: Any = None):
-        # If credential is not provided, it tries to use DefaultAzureCredential or env vars
-        if not credential:
-            # For simplicity in this implementation, we expect AZURE_STORAGE_CONNECTION_STRING or similar
-            # But typically we'd use DefaultAzureCredential() for production
-            from azure.identity import DefaultAzureCredential
-            credential = DefaultAzureCredential()
+    def __init__(self, account_url: str = None, connection_string: str = None, credential: Any = None):
+        if connection_string:
+            self.service_client = BlobServiceClient.from_connection_string(connection_string)
+        else:
+            if not account_url:
+                raise ValueError("Either connection_string or account_url must be provided.")
             
-        self.service_client = BlobServiceClient(account_url=account_url, credential=credential)
+            if not credential:
+                from azure.identity import DefaultAzureCredential
+                credential = DefaultAzureCredential()
+                
+            self.service_client = BlobServiceClient(account_url=account_url, credential=credential)
 
     def list_blobs(self, container_name: str, prefix: str = None) -> Generator[BlobProperties, None, None]:
         container_client = self.service_client.get_container_client(container_name)
@@ -27,7 +28,3 @@ class AzureClient:
     def blob_exists(self, container_name: str, blob_name: str) -> bool:
         blob_client = self.service_client.get_blob_client(container=container_name, blob=blob_name)
         return blob_client.exists()
-
-    def upload_blob(self, container_name: str, blob_name: str, data: bytes, overwrite: bool = True):
-        blob_client = self.service_client.get_blob_client(container=container_name, blob=blob_name)
-        blob_client.upload_blob(data, overwrite=overwrite)

@@ -42,9 +42,13 @@ resource "azurerm_storage_container" "custom_logs" {
   container_access_type = "private"
 }
 
-# Container for forwarder state checkpoints
-resource "azurerm_storage_container" "forwarder_state" {
-  name                  = "forwarder-state"
-  storage_account_name  = azurerm_storage_account.secops_sa.name
-  container_access_type = "private"
+# Table for forwarder state checkpoints
+resource "azurerm_storage_table" "forwarder_state" {
+  name                 = "forwarderstate"
+  storage_account_name = azurerm_storage_account.secops_sa.name
+}
+
+output "storage_account_connection_string" {
+  value     = azurerm_storage_account.secops_sa.primary_connection_string
+  sensitive = true
 }
